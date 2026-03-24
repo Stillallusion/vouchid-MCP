@@ -1,23 +1,23 @@
 /**
- * @agentid/mcp — AgentID Identity Middleware for MCP Servers
+ * @vouchid/mcp — VouchID Identity Middleware for MCP Servers
  *
  * Intercepts every MCP tool call and verifies the calling agent's identity
- * before the request reaches your server. Drop-in, zero-config for most setups.
+ * before the request reaches your handler. Drop-in, zero-config for most setups.
  *
  * @example
- *   import { AgentIDMiddleware } from "@agentid/mcp";
+ *   import { AgentIDMiddleware, getAgentIdentity } from "@vouchid/mcp";
  *
  *   const middleware = new AgentIDMiddleware({
- *     apiUrl: process.env.AGENTID_API_URL,
- *     apiKey: process.env.AGENTID_API_KEY,
+ *     apiUrl: process.env.VOUCHID_API_URL,
+ *     apiKey: process.env.VOUCHID_API_KEY,
  *     toolCapabilities: {
  *       read_file:  "read:filesystem",
  *       write_file: "write:filesystem",
  *     },
  *   });
  *
- *   server.setRequestHandler(CallToolRequestSchema, middleware.wrap(async (req) => {
- *     const agent = getAgentIdentity(req); // { id, name, capabilities, … }
+ *   server.setRequestHandler(CallToolRequestSchema, middleware.wrap(async (request) => {
+ *     const agent = getAgentIdentity(request); // { id, name, capabilities, … }
  *     // … your handler
  *   }));
  */
@@ -44,13 +44,13 @@ const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 export class AgentIDMiddleware {
   /**
    * @param {object}  options
-   * @param {string}  options.apiUrl                - Base URL of your AgentID backend.
-   * @param {string}  options.apiKey                - Org API key used to authenticate outbound verify calls.
+   * @param {string}  options.apiUrl                - Base URL of your VouchID backend.
+   * @param {string}  options.apiKey                - Org API key for outbound verify calls.
    * @param {object}  [options.toolCapabilities={}] - Map of tool name → required capability string.
    * @param {boolean} [options.strict=true]         - When true, requests without a token are rejected.
    * @param {number}  [options.timeoutMs]           - Per-request timeout in ms (default 8 000).
    * @param {number}  [options.maxRetries]          - Retry attempts on transient errors (default 2).
-   * @param {object}  [options.logger]              - Custom logger. Must expose `.warn()` and `.error()`.
+   * @param {object}  [options.logger]              - Custom logger with `.warn()` and `.error()`.
    *                                                  Pass `null` to silence all output.
    */
   constructor(options = {}) {
@@ -71,7 +71,7 @@ export class AgentIDMiddleware {
         : (options.logger ?? _defaultLogger);
   }
 
-  // ── Public API ─────────────────────────────────────────────────────────────
+  // ── Public API ──────────────────────────────────────────────────────────────
 
   /**
    * Verify the calling agent's identity.
@@ -85,23 +85,23 @@ export class AgentIDMiddleware {
   async verifyRequest(request) {
     const token = _extractToken(request);
 
-    // ── No token ────────────────────────────────────────────────────────────
+    // ── No token ──────────────────────────────────────────────────────────────
     if (!token) {
       if (this.strict) {
         throw new AgentIDError(
           "MISSING_TOKEN",
-          "No agent token provided. Pass _agentid_token in params or X-Agent-Token header.",
+          "No agent token provided. Pass _agentid_token in arguments or X-Agent-Token header.",
         );
       }
       return { allowed: true, verified: false, agent: null };
     }
 
-    // ── Basic token sanity check ────────────────────────────────────────────
+    // ── Basic token sanity check ──────────────────────────────────────────────
     if (typeof token !== "string" || token.length > MAX_TOKEN_LENGTH) {
       throw new AgentIDError("INVALID_TOKEN", "Token format is invalid.");
     }
 
-    // ── Remote verification ─────────────────────────────────────────────────
+    // ── Remote verification ───────────────────────────────────────────────────
     const verifyResult = await this._callVerifyAPI(token);
 
     if (!verifyResult.valid) {
@@ -111,8 +111,10 @@ export class AgentIDMiddleware {
       );
     }
 
-    // ── Capability check ────────────────────────────────────────────────────
-    const toolName = request?.method ?? request?.params?.name;
+    // ── Capability check ──────────────────────────────────────────────────────
+    // FIX: use request.params.name (the tool name) instead of request.method
+    // (which is always "tools/call" for every MCP tool call).
+    const toolName = request?.params?.name;
     const requiredCap = this.toolCapabilities[toolName];
 
     if (requiredCap) {
@@ -140,8 +142,9 @@ export class AgentIDMiddleware {
    * Wrap an MCP request handler with automatic identity verification.
    *
    * The verified `AgentInfo` is available inside your handler via
-   * `getAgentIdentity(request)` — it is attached as a non-enumerable
-   * property so it does not appear in JSON serialization.
+   * `getAgentIdentity(request)`. The token is automatically stripped
+   * from the arguments before your handler runs so downstream logic
+   * does not need to filter it out.
    *
    * @template T
    * @param {(request: object) => Promise<T>} handler
@@ -153,9 +156,15 @@ export class AgentIDMiddleware {
     }
 
     return async (request) => {
+      // FIX: strip the token from arguments before the handler runs so
+      // downstream code never sees it, and so args stay clean.
+      if (request?.params?.arguments?._agentid_token) {
+        delete request.params.arguments._agentid_token;
+      }
+
       const identity = await this.verifyRequest(request);
 
-      // Attach as non-enumerable so it doesn't bleed into JSON serialization.
+      // Attach as non-enumerable so it doesn't bleed into JSON serialisation.
       Object.defineProperty(request, "_identity", {
         value: identity,
         writable: false,
@@ -167,15 +176,8 @@ export class AgentIDMiddleware {
     };
   }
 
-  // ── Private helpers ────────────────────────────────────────────────────────
+  // ── Private helpers ─────────────────────────────────────────────────────────
 
-  /**
-   * POST to /v1/agents/verify with exponential back-off retry for transient
-   * network errors and 5xx / 429 responses.
-   *
-   * @param {string} token
-   * @returns {Promise<object>}
-   */
   async _callVerifyAPI(token) {
     let lastError;
 
@@ -200,16 +202,14 @@ export class AgentIDMiddleware {
 
         clearTimeout(timer);
 
-        // Retry on server-side / rate-limit errors
         if (RETRYABLE_STATUS_CODES.has(res.status)) {
           lastError = new AgentIDError(
             "API_ERROR",
-            `AgentID API returned ${res.status}. Retrying…`,
+            `VouchID API returned ${res.status}. Retrying…`,
           );
           continue;
         }
 
-        // Any other non-2xx is a hard failure — don't retry
         if (!res.ok) {
           let reason = "";
           try {
@@ -219,7 +219,7 @@ export class AgentIDMiddleware {
           }
           throw new AgentIDError(
             "API_ERROR",
-            `AgentID API error (${res.status})${reason ? `: ${reason}` : "."}`,
+            `VouchID API error (${res.status})${reason ? `: ${reason}` : "."}`,
           );
         }
 
@@ -227,14 +227,14 @@ export class AgentIDMiddleware {
       } catch (err) {
         clearTimeout(timer);
 
-        if (err instanceof AgentIDError) throw err; // hard failures propagate immediately
+        if (err instanceof AgentIDError) throw err;
 
         const isTimeout = err.name === "AbortError";
         lastError = new AgentIDError(
           "API_UNREACHABLE",
           isTimeout
-            ? `AgentID API timed out after ${this.timeoutMs}ms.`
-            : `Could not reach AgentID API: ${err.message}`,
+            ? `VouchID API timed out after ${this.timeoutMs}ms.`
+            : `Could not reach VouchID API: ${err.message}`,
         );
 
         this.logger.warn(
@@ -251,7 +251,6 @@ export class AgentIDMiddleware {
 
 /**
  * Thrown by AgentIDMiddleware on all identity/auth failures.
- * Catch this specifically to handle AgentID errors without catching everything.
  *
  * @property {string} code - Machine-readable error code.
  */
@@ -261,31 +260,49 @@ export class AgentIDError extends Error {
     this.name = "AgentIDError";
     this.code = code;
 
-    // Preserve stack trace in V8
     if (Error.captureStackTrace) {
       Error.captureStackTrace(this, AgentIDError);
     }
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Exported helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Returns the verified AgentInfo attached to the request by `wrap()`.
+ * Returns `null` if verification was skipped (non-strict mode, no token).
+ *
+ * @param {object} request - The request object passed to your handler.
+ * @returns {AgentInfo|null}
+ */
+export function getAgentIdentity(request) {
+  return request._identity?.agent ?? null;
+}
+
+// ─── Private utilities ────────────────────────────────────────────────────────
 
 /**
  * Extract a token from an MCP request.
- * Checks `params._agentid_token` first, then `X-Agent-Token` header.
+ *
+ * Checks in order:
+ *   1. `params.arguments._agentid_token`  — standard MCP tool call location
+ *   2. `params._agentid_token`            — legacy / direct attach
+ *   3. `headers["x-agent-token"]`         — HTTP transport header
  *
  * @param {object} request
  * @returns {string|null}
  */
 function _extractToken(request) {
-  const fromParams = request?.params?._agentid_token;
-  const fromHeader = request?.headers?.["x-agent-token"];
-  return (fromParams || fromHeader) ?? null;
+  return (
+    request?.params?.arguments?._agentid_token ??
+    request?.params?._agentid_token ??
+    request?.headers?.["x-agent-token"] ??
+    null
+  );
 }
 
 /**
- * Build a clean, serialisable AgentInfo object from the raw API response.
- * Only known fields are included — no raw API bleed-through.
+ * Build a clean AgentInfo object from the raw API response.
  *
  * @param {object} raw
  * @returns {AgentInfo}
@@ -299,17 +316,6 @@ function _buildAgentInfo(raw) {
     trustLevel: raw.trust_level ?? "untrusted",
     trustScore: raw.trust_score ?? 0,
   };
-}
-
-/**
- * Returns the verified AgentInfo attached to the request by `wrap()`.
- * Returns `null` if verification was skipped (non-strict mode, no token).
- *
- * @param {object} request - The request object passed to your handler.
- * @returns {AgentInfo|null}
- */
-export function getAgentIdentity(request) {
-  return request._identity?.agent ?? null;
 }
 
 /** @param {number} ms */
@@ -331,7 +337,7 @@ const _defaultLogger = {
  * @property {string|null}   name         - Human-readable agent name.
  * @property {string|null}   org          - Owning organisation ID.
  * @property {string[]}      capabilities - Granted capability strings.
- * @property {string}        trustLevel   - "untrusted" | "low" | "medium" | "high".
+ * @property {string}        trustLevel   - "untrusted" | "low" | "medium" | "high" | "verified".
  * @property {number}        trustScore   - Numeric trust score (0–100).
  */
 
