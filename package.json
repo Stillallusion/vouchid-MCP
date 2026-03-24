@@ -1,0 +1,31 @@
+{
+  "name": "@vouchid/mcp",
+  "version": "1.0.0",
+  "description": "VouchID identity middleware for MCP servers. verify every tool call before it runs",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "lint": "node --check index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "agents",
+    "identity",
+    "security",
+    "vouchid"
+  ],
+  "author": "Stillallusion",
+  "license": "MIT"
+}
