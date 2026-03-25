@@ -2,9 +2,10 @@
  * @vouchid/mcp — VouchID Identity Middleware for MCP Servers
  *
  * Intercepts every MCP tool call and verifies the calling agent's identity
- * before the request reaches your handler. Drop-in, zero-config for most setups.
+ * before the request reaches your handler. Optionally enforces backend policies
+ * including rate limits, amount limits, and human approval — all automatically.
  *
- * @example
+ * @example Basic usage
  *   import { AgentIDMiddleware, getAgentIdentity } from "@vouchid/mcp";
  *
  *   const middleware = new AgentIDMiddleware({
@@ -17,9 +18,22 @@
  *   });
  *
  *   server.setRequestHandler(CallToolRequestSchema, middleware.wrap(async (request) => {
- *     const agent = getAgentIdentity(request); // { id, name, capabilities, … }
- *     // … your handler
+ *     const agent = getAgentIdentity(request);
+ *     // agent is verified — your handler runs only if all checks pass
  *   }));
+ *
+ * @example With policy enforcement and human approval
+ *   const middleware = new AgentIDMiddleware({
+ *     apiUrl: process.env.VOUCHID_API_URL,
+ *     apiKey: process.env.VOUCHID_API_KEY,
+ *     toolCapabilities: {
+ *       read_file:  "read:filesystem",
+ *       write_file: "write:filesystem",
+ *     },
+ *     enforcePolicy:     true,    // check-permission called automatically
+ *     approvalTimeoutMs: 300_000, // wait up to 5 min for human approval
+ *     approvalPollMs:    3_000,   // poll every 3 seconds
+ *   });
  */
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -39,19 +53,29 @@ const RETRY_BASE_DELAY_MS = 200;
 /** HTTP status codes that are safe to retry. */
 const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 
+/** Default approval polling interval in ms. */
+const DEFAULT_APPROVAL_POLL_MS = 3_000;
+
+/** Default approval timeout in ms (5 minutes). */
+const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
+
 // ─── AgentIDMiddleware ────────────────────────────────────────────────────────
 
 export class AgentIDMiddleware {
   /**
    * @param {object}  options
-   * @param {string}  options.apiUrl                - Base URL of your VouchID backend.
-   * @param {string}  options.apiKey                - Org API key for outbound verify calls.
-   * @param {object}  [options.toolCapabilities={}] - Map of tool name → required capability string.
-   * @param {boolean} [options.strict=true]         - When true, requests without a token are rejected.
-   * @param {number}  [options.timeoutMs]           - Per-request timeout in ms (default 8 000).
-   * @param {number}  [options.maxRetries]          - Retry attempts on transient errors (default 2).
-   * @param {object}  [options.logger]              - Custom logger with `.warn()` and `.error()`.
-   *                                                  Pass `null` to silence all output.
+   * @param {string}  options.apiUrl                 - Base URL of your VouchID backend.
+   * @param {string}  options.apiKey                 - Org API key for outbound verify/policy calls.
+   * @param {object}  [options.toolCapabilities={}]  - Map of tool name → required capability string.
+   * @param {boolean} [options.strict=true]          - When true, requests without a token are rejected.
+   * @param {boolean} [options.enforcePolicy=false]  - When true, calls check-permission on every tool
+   *                                                   call and handles approval polling automatically.
+   * @param {number}  [options.approvalTimeoutMs]    - How long to wait for human approval (default 5 min).
+   * @param {number}  [options.approvalPollMs]       - How often to poll for approval status (default 3s).
+   * @param {number}  [options.timeoutMs]            - Per-request timeout in ms (default 8 000).
+   * @param {number}  [options.maxRetries]           - Retry attempts on transient errors (default 2).
+   * @param {object}  [options.logger]               - Custom logger with `.warn()` and `.error()`.
+   *                                                   Pass `null` to silence all output.
    */
   constructor(options = {}) {
     if (!options.apiUrl)
@@ -63,6 +87,10 @@ export class AgentIDMiddleware {
     this.apiKey = options.apiKey;
     this.toolCapabilities = options.toolCapabilities ?? {};
     this.strict = options.strict !== false;
+    this.enforcePolicy = options.enforcePolicy ?? false;
+    this.approvalTimeoutMs =
+      options.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+    this.approvalPollMs = options.approvalPollMs ?? DEFAULT_APPROVAL_POLL_MS;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.logger =
@@ -71,7 +99,7 @@ export class AgentIDMiddleware {
         : (options.logger ?? _defaultLogger);
   }
 
-  // ── Public API ──────────────────────────────────────────────────────────────
+  // ── Public API ─────────────────────────────────────────────────────────────
 
   /**
    * Verify the calling agent's identity.
@@ -85,7 +113,7 @@ export class AgentIDMiddleware {
   async verifyRequest(request) {
     const token = _extractToken(request);
 
-    // ── No token ──────────────────────────────────────────────────────────────
+    // ── No token ─────────────────────────────────────────────────────────────
     if (!token) {
       if (this.strict) {
         throw new AgentIDError(
@@ -112,8 +140,8 @@ export class AgentIDMiddleware {
     }
 
     // ── Capability check ──────────────────────────────────────────────────────
-    // FIX: use request.params.name (the tool name) instead of request.method
-    // (which is always "tools/call" for every MCP tool call).
+    // NOTE: request.method is always "tools/call" for every MCP tool call and
+    // cannot be used for capability lookup. Use request.params.name instead.
     const toolName = request?.params?.name;
     const requiredCap = this.toolCapabilities[toolName];
 
@@ -139,12 +167,19 @@ export class AgentIDMiddleware {
   }
 
   /**
-   * Wrap an MCP request handler with automatic identity verification.
+   * Wrap an MCP request handler with automatic identity verification and
+   * optional policy enforcement.
+   *
+   * When `enforcePolicy` is true, the middleware will:
+   *   1. Verify the agent token
+   *   2. Call POST /v1/agents/check-permission on your backend
+   *   3. If the backend returns `requires_approval: true`, poll
+   *      GET /v1/approvals/:id/status until approved, denied, or timed out
+   *   4. Only call your handler if everything passes
    *
    * The verified `AgentInfo` is available inside your handler via
-   * `getAgentIdentity(request)`. The token is automatically stripped
-   * from the arguments before your handler runs so downstream logic
-   * does not need to filter it out.
+   * `getAgentIdentity(request)`. The token is stripped from arguments
+   * before your handler runs.
    *
    * @template T
    * @param {(request: object) => Promise<T>} handler
@@ -156,15 +191,18 @@ export class AgentIDMiddleware {
     }
 
     return async (request) => {
-      // FIX: strip the token from arguments before the handler runs so
-      // downstream code never sees it, and so args stay clean.
+      // Hoist token from arguments (where MCP places tool call args) up to
+      // params where verifyRequest can find it, then strip it so handlers
+      // never see it.
       if (request?.params?.arguments?._agentid_token) {
+        request.params._agentid_token = request.params.arguments._agentid_token;
         delete request.params.arguments._agentid_token;
       }
 
+      // ── Step 1: verify token + capability ──────────────────────────────────
       const identity = await this.verifyRequest(request);
 
-      // Attach as non-enumerable so it doesn't bleed into JSON serialisation.
+      // Attach as non-enumerable so it doesn't appear in JSON serialisation.
       Object.defineProperty(request, "_identity", {
         value: identity,
         writable: false,
@@ -172,12 +210,134 @@ export class AgentIDMiddleware {
         configurable: false,
       });
 
+      // ── Step 2: enforce backend policy (optional) ───────────────────────────
+      if (this.enforcePolicy && identity.verified) {
+        const toolName = request?.params?.name;
+        const capability = this.toolCapabilities[toolName];
+
+        if (capability) {
+          await this._enforcePolicy(
+            identity.agent,
+            capability,
+            request.params.arguments ?? {},
+          );
+        }
+      }
+
       return handler(request);
     };
   }
 
-  // ── Private helpers ─────────────────────────────────────────────────────────
+  // ── Private: policy enforcement ────────────────────────────────────────────
 
+  /**
+   * Call POST /v1/agents/check-permission and handle the result.
+   * If the backend requires human approval, polls until resolved.
+   *
+   * @param {AgentInfo} agent
+   * @param {string}    capability
+   * @param {object}    context     - Tool arguments passed as context to the backend.
+   */
+  async _enforcePolicy(agent, capability, context) {
+    const res = await fetch(`${this.apiUrl}/v1/agents/check-permission`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({ agent_id: agent.id, capability, context }),
+    });
+
+    if (!res.ok) {
+      let reason = "";
+      try {
+        reason = (await res.json()).error ?? "";
+      } catch {
+        /* ignore */
+      }
+      throw new AgentIDError(
+        "API_ERROR",
+        `check-permission failed (${res.status})${reason ? `: ${reason}` : "."}`,
+      );
+    }
+
+    const perm = await res.json();
+
+    // ── Requires human approval ───────────────────────────────────────────────
+    if (perm.requires_approval) {
+      this.logger.warn(
+        `[AgentIDMiddleware] Human approval required — id: ${perm.approval_id}`,
+      );
+
+      const approved = await this._pollApproval(perm.approval_id);
+
+      if (!approved) {
+        throw new AgentIDError(
+          "APPROVAL_DENIED",
+          `Action was denied by a human reviewer (approval: ${perm.approval_id}).`,
+        );
+      }
+
+      this.logger.warn(
+        `[AgentIDMiddleware] Approval granted — id: ${perm.approval_id}`,
+      );
+      return;
+    }
+
+    // ── Denied by policy (rate limit, amount exceeded, etc.) ─────────────────
+    if (!perm.allowed) {
+      throw new AgentIDError(
+        "POLICY_DENIED",
+        perm.reason ?? "Action denied by policy.",
+      );
+    }
+  }
+
+  /**
+   * Poll GET /v1/approvals/:id/status until approved, denied, or timed out.
+   *
+   * @param {string} approvalId
+   * @returns {Promise<boolean>} true if approved, false if denied.
+   */
+  async _pollApproval(approvalId) {
+    const deadline = Date.now() + this.approvalTimeoutMs;
+
+    while (Date.now() < deadline) {
+      const res = await fetch(
+        `${this.apiUrl}/v1/approvals/${encodeURIComponent(approvalId)}/status`,
+        { headers: { Authorization: `Bearer ${this.apiKey}` } },
+      );
+
+      if (!res.ok) {
+        throw new AgentIDError(
+          "API_ERROR",
+          `Approval status poll failed (${res.status}) for id: ${approvalId}.`,
+        );
+      }
+
+      const { status } = await res.json();
+
+      if (status === "approved") return true;
+      if (status === "denied") return false;
+
+      // status === "pending" — wait and retry
+      await _sleep(this.approvalPollMs);
+    }
+
+    throw new AgentIDError(
+      "APPROVAL_TIMEOUT",
+      `Approval request ${approvalId} timed out after ${this.approvalTimeoutMs / 1000}s.`,
+    );
+  }
+
+  // ── Private: verify API ────────────────────────────────────────────────────
+
+  /**
+   * POST to /v1/agents/verify with exponential back-off retry.
+   *
+   * @param {string} token
+   * @returns {Promise<object>}
+   */
   async _callVerifyAPI(token) {
     let lastError;
 
@@ -250,7 +410,7 @@ export class AgentIDMiddleware {
 // ─── AgentIDError ─────────────────────────────────────────────────────────────
 
 /**
- * Thrown by AgentIDMiddleware on all identity/auth failures.
+ * Thrown by AgentIDMiddleware on all identity/auth/policy failures.
  *
  * @property {string} code - Machine-readable error code.
  */
@@ -285,9 +445,9 @@ export function getAgentIdentity(request) {
  * Extract a token from an MCP request.
  *
  * Checks in order:
- *   1. `params.arguments._agentid_token`  — standard MCP tool call location
- *   2. `params._agentid_token`            — legacy / direct attach
- *   3. `headers["x-agent-token"]`         — HTTP transport header
+ *   1. params.arguments._agentid_token  — standard MCP tool call location
+ *   2. params._agentid_token            — already hoisted (idempotent)
+ *   3. headers["x-agent-token"]         — HTTP transport header
  *
  * @param {object} request
  * @returns {string|null}
@@ -302,7 +462,7 @@ function _extractToken(request) {
 }
 
 /**
- * Build a clean AgentInfo object from the raw API response.
+ * Build a clean AgentInfo object from the raw verify API response.
  *
  * @param {object} raw
  * @returns {AgentInfo}
