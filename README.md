@@ -152,13 +152,6 @@ For the full client SDK, see [`@vouchid/sdk`](https://www.npmjs.com/package/@vou
 
 ---
 
-## Requirements
-
-- Node.js 18 or later
-- ESM (`"type": "module"`) or a bundler that handles ESM
-
----
-
 ## License
 
 MIT
